@@ -1,0 +1,294 @@
+{
+  "name": "07 - Predictive SLA Breach Monitor & Auto-Escalator",
+  "nodes": [
+    {
+      "id": "a7000001-0000-4000-8000-000000000001",
+      "name": "Every 15 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [250, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "a7000001-0000-4000-8000-000000000002",
+      "name": "Define SLA Policy",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 300],
+      "parameters": {
+        "jsCode": "// SLA response & resolution time targets (in minutes)\nconst SLA_POLICY = {\n  critical: { first_response_mins: 15, resolution_mins: 240, escalation_at_percent: 70 },\n  high:     { first_response_mins: 60, resolution_mins: 480, escalation_at_percent: 75 },\n  medium:   { first_response_mins: 240, resolution_mins: 1440, escalation_at_percent: 80 },\n  low:      { first_response_mins: 480, resolution_mins: 4320, escalation_at_percent: 85 }\n};\n\nconst ESCALATION_CONTACTS = {\n  critical: { slack_user: '@oncall-lead', email: 'oncall@REPLACE_YOUR_DOMAIN.com' },\n  high:     { slack_user: '@support-lead', email: 'support-lead@REPLACE_YOUR_DOMAIN.com' },\n  medium:   { slack_user: '@support-manager', email: 'support-manager@REPLACE_YOUR_DOMAIN.com' },\n  low:      { slack_user: '@support-team', email: 'support@REPLACE_YOUR_DOMAIN.com' }\n};\n\nreturn [{ json: { sla_policy: SLA_POLICY, escalation_contacts: ESCALATION_CONTACTS, check_time: new Date().toISOString() } }];"
+      }
+    },
+    {
+      "id": "a7000001-0000-4000-8000-000000000003",
+      "name": "Fetch Open Tickets from Helpdesk",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 300],
+      "parameters": {
+        "method": "GET",
+        "url": "https://REPLACE_YOUR_HELPDESK.freshdesk.com/api/v2/tickets",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
+        "queryParameters": {
+          "parameters": [
+            { "name": "filter", "value": "open" },
+            { "name": "include", "value": "stats" },
+            { "name": "per_page", "value": "100" }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpBearerAuth": {
+          "id": "REPLACE_WITH_FRESHDESK_TOKEN_CREDENTIAL_ID",
+          "name": "Freshdesk API Token"
+        }
+      }
+    },
+    {
+      "id": "a7000001-0000-4000-8000-000000000004",
+      "name": "Calculate SLA Risk Per Ticket",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 300],
+      "parameters": {
+        "jsCode": "const tickets = Array.isArray($input.item.json) ? $input.item.json : [$input.item.json];\nconst slaPolicy = {\n  critical: { first_response_mins: 15, resolution_mins: 240, escalation_at_percent: 70 },\n  high:     { first_response_mins: 60, resolution_mins: 480, escalation_at_percent: 75 },\n  medium:   { first_response_mins: 240, resolution_mins: 1440, escalation_at_percent: 80 },\n  low:      { first_response_mins: 480, resolution_mins: 4320, escalation_at_percent: 85 }\n};\n\nconst priorityMap = { 1: 'low', 2: 'medium', 3: 'high', 4: 'critical' };\nconst now = Date.now();\n\nconst analyzed = tickets.map(ticket => {\n  const priority = priorityMap[ticket.priority] ?? 'medium';\n  const policy = slaPolicy[priority];\n  \n  const createdAt = new Date(ticket.created_at).getTime();\n  const ageMinutes = (now - createdAt) / 60000;\n  \n  // SLA deadline = created_at + resolution_mins\n  const slaDeadline = new Date(createdAt + policy.resolution_mins * 60000);\n  const minutesToBreach = (slaDeadline.getTime() - now) / 60000;\n  const percentElapsed = Math.round((ageMinutes / policy.resolution_mins) * 100);\n  \n  const hasFirstResponse = !!ticket.stats?.first_responded_at;\n  const firstResponseAge = hasFirstResponse \n    ? (new Date(ticket.stats.first_responded_at).getTime() - createdAt) / 60000 \n    : ageMinutes;\n  const firstResponseBreached = !hasFirstResponse && ageMinutes > policy.first_response_mins;\n  \n  let risk_level;\n  if (minutesToBreach < 0) risk_level = 'breached';\n  else if (percentElapsed >= policy.escalation_at_percent) risk_level = 'critical_risk';\n  else if (percentElapsed >= 50) risk_level = 'at_risk';\n  else risk_level = 'on_track';\n  \n  const needsEscalation = risk_level === 'breached' || risk_level === 'critical_risk';\n  \n  return {\n    ticket_id: ticket.id,\n    subject: ticket.subject,\n    requester_id: ticket.requester_id,\n    assignee_id: ticket.responder_id,\n    priority,\n    status: ticket.status,\n    age_minutes: Math.round(ageMinutes),\n    minutes_to_breach: Math.round(minutesToBreach),\n    percent_elapsed: percentElapsed,\n    sla_deadline: slaDeadline.toISOString(),\n    risk_level,\n    needs_escalation: needsEscalation,\n    first_response_breached: firstResponseBreached,\n    has_first_response: hasFirstResponse,\n    created_at: ticket.created_at,\n    tags: ticket.tags ?? []\n  };\n});\n\n// Sort by risk (breached first, then by minutes_to_breach ascending)\nanalyzed.sort((a, b) => {\n  const riskOrder = { breached: 0, critical_risk: 1, at_risk: 2, on_track: 3 };\n  const rDiff = riskOrder[a.risk_level] - riskOrder[b.risk_level];\n  if (rDiff !== 0) return rDiff;\n  return a.minutes_to_breach - b.minutes_to_breach;\n});\n\nconst needsAction = analyzed.filter(t => t.needs_escalation);\n\nreturn needsAction.map(t => ({ json: t }));"
+      }
+    },
+    {
+      "id": "a7000001-0000-4000-8000-000000000005",
+      "name": "AI Suggest Resolution Approach",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1.4,
+      "position": [1200, 300],
+      "parameters": {
+        "resource": "chat",
+        "operation": "complete",
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list"
+        },
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an expert support operations manager. Given a ticket approaching or past its SLA deadline, provide a brief escalation message and resolution strategy. Return JSON only:\n{\n  \"escalation_message\": \"professional Slack message announcing the escalation (2-3 sentences)\",\n  \"immediate_actions\": [\"action1\", \"action2\", \"action3\"],\n  \"resolution_estimate_mins\": number,\n  \"escalation_reason\": \"one sentence\"\n}"
+            },
+            {
+              "role": "user",
+              "content": "Ticket #{{ $json.ticket_id }}: {{ $json.subject }}\nPriority: {{ $json.priority }}\nRisk Level: {{ $json.risk_level }}\nAge: {{ $json.age_minutes }} minutes\nMinutes to Breach: {{ $json.minutes_to_breach }}\nSLA Elapsed: {{ $json.percent_elapsed }}%\nFirst Response Sent: {{ $json.has_first_response }}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.2,
+          "maxTokens": 400
+        }
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_WITH_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "id": "a7000001-0000-4000-8000-000000000006",
+      "name": "Parse AI Escalation Plan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 300],
+      "parameters": {
+        "jsCode": "const raw = $input.item.json.message?.content ?? '{}';\nlet aiPlan;\ntry { aiPlan = JSON.parse(raw); }\ncatch { aiPlan = { escalation_message: 'Ticket requires immediate attention.', immediate_actions: ['Review ticket', 'Contact requester', 'Escalate to senior agent'], resolution_estimate_mins: 60, escalation_reason: 'SLA breach imminent' }; }\n\nreturn {\n  ...($input.item.json),\n  ai_escalation_message: aiPlan.escalation_message,\n  ai_immediate_actions: aiPlan.immediate_actions,\n  ai_resolution_estimate_mins: aiPlan.resolution_estimate_mins,\n  ai_escalation_reason: aiPlan.escalation_reason,\n  status_emoji: $input.item.json.risk_level === 'breached' ? ':red_circle:' : ':large_orange_circle:'\n};"
+      }
+    },
+    {
+      "id": "a7000001-0000-4000-8000-000000000007",
+      "name": "Post Escalation to Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1680, 200],
+      "parameters": {
+        "resource": "message",
+        "operation": "post",
+        "channel": {
+          "__rl": true,
+          "value": "#support-escalations",
+          "mode": "name"
+        },
+        "text": "={{ $json.status_emoji + ' SLA ' + ($json.risk_level === 'breached' ? 'BREACHED' : 'CRITICAL RISK') + ': Ticket #' + $json.ticket_id }}",
+        "blocksUi": {
+          "blocksValues": [
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "={{ $json.status_emoji + ' *SLA ' + ($json.risk_level === 'breached' ? 'BREACHED' : 'CRITICAL RISK') + '* — Ticket #' + $json.ticket_id }}\n*Subject:* {{ $json.subject }}\n*Priority:* {{ $json.priority.toUpperCase() }}  |  *Age:* {{ $json.age_minutes }}min  |  *SLA Elapsed:* {{ $json.percent_elapsed }}%\n*Minutes to/past breach:* {{ $json.minutes_to_breach > 0 ? $json.minutes_to_breach + 'min remaining' : Math.abs($json.minutes_to_breach) + 'min PAST due' }}"
+              }
+            },
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                "text": "*AI Analysis:* {{ $json.ai_escalation_message }}\n\n*Immediate Actions Required:*\n={{ $json.ai_immediate_actions?.map(a => '• ' + a).join('\\n') }}"
+              }
+            },
+            {
+              "type": "actions",
+              "elements": [
+                {
+                  "type": "button",
+                  "text": { "type": "plain_text", "text": "View Ticket" },
+                  "style": "danger",
+                  "url": "https://REPLACE_YOUR_HELPDESK.freshdesk.com/a/tickets/{{ $json.ticket_id }}"
+                }
+              ]
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_WITH_SLACK_CREDENTIAL_ID",
+          "name": "Slack API"
+        }
+      }
+    },
+    {
+      "id": "a7000001-0000-4000-8000-000000000008",
+      "name": "Update Ticket Priority in Helpdesk",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1680, 400],
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://REPLACE_YOUR_HELPDESK.freshdesk.com/api/v2/tickets/{{ $json.ticket_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ priority: $json.priority === 'low' || $json.priority === 'medium' ? 3 : 4, tags: [...($json.tags ?? []), 'sla-escalated', 'auto-escalated'] }) }}",
+        "options": {}
+      },
+      "credentials": {
+        "httpBearerAuth": {
+          "id": "REPLACE_WITH_FRESHDESK_TOKEN_CREDENTIAL_ID",
+          "name": "Freshdesk API Token"
+        }
+      }
+    },
+    {
+      "id": "a7000001-0000-4000-8000-000000000009",
+      "name": "Log Escalation to DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1920, 300],
+      "parameters": {
+        "operation": "insert",
+        "schema": { "__rl": true, "value": "public", "mode": "list" },
+        "table": { "__rl": true, "value": "sla_escalations", "mode": "list" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "ticket_id": "={{ $json.ticket_id }}",
+            "subject": "={{ $json.subject }}",
+            "priority": "={{ $json.priority }}",
+            "risk_level": "={{ $json.risk_level }}",
+            "age_minutes": "={{ $json.age_minutes }}",
+            "minutes_to_breach": "={{ $json.minutes_to_breach }}",
+            "percent_elapsed": "={{ $json.percent_elapsed }}",
+            "ai_escalation_reason": "={{ $json.ai_escalation_reason }}",
+            "escalated_at": "={{ new Date().toISOString() }}"
+          }
+        },
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_WITH_POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 15 Minutes": {
+      "main": [
+        [{ "node": "Define SLA Policy", "type": "main", "index": 0 }]
+      ]
+    },
+    "Define SLA Policy": {
+      "main": [
+        [{ "node": "Fetch Open Tickets from Helpdesk", "type": "main", "index": 0 }]
+      ]
+    },
+    "Fetch Open Tickets from Helpdesk": {
+      "main": [
+        [{ "node": "Calculate SLA Risk Per Ticket", "type": "main", "index": 0 }]
+      ]
+    },
+    "Calculate SLA Risk Per Ticket": {
+      "main": [
+        [{ "node": "AI Suggest Resolution Approach", "type": "main", "index": 0 }]
+      ]
+    },
+    "AI Suggest Resolution Approach": {
+      "main": [
+        [{ "node": "Parse AI Escalation Plan", "type": "main", "index": 0 }]
+      ]
+    },
+    "Parse AI Escalation Plan": {
+      "main": [
+        [
+          { "node": "Post Escalation to Slack", "type": "main", "index": 0 },
+          { "node": "Update Ticket Priority in Helpdesk", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Post Escalation to Slack": {
+      "main": [
+        [{ "node": "Log Escalation to DB", "type": "main", "index": 0 }]
+      ]
+    },
+    "Update Ticket Priority in Helpdesk": {
+      "main": [
+        [{ "node": "Log Escalation to DB", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": false
+  },
+  "id": "wf-sla-breach-monitor-v1",
+  "meta": {
+    "instanceId": "REPLACE_WITH_YOUR_N8N_INSTANCE_ID",
+    "templateCredsSetupCompleted": false
+  },
+  "tags": ["support", "sla", "operations", "escalation", "ai", "production"]
+}
